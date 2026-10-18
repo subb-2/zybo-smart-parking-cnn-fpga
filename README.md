@@ -55,9 +55,9 @@
 
 ## 🏗️ 시스템 구조
 
-```
+
  <img width="1231" height="744" alt="Image" src="https://github.com/user-attachments/assets/c94fa3c6-9bed-499f-aea9-f97c1d6eb3f0" />
-```
+
 
 * **클럭 영역**: 영상 경로는 Pcam 영상 pclk, 초음파 센서 FSM과 AXI 로직은 PS의 100MHz(FCLK_CLK0)에서 동작합니다. 두 영역을 오가는 1비트 제어 신호는 모두 Toggle 방식 Pulse Synchronizer로 넘겼습니다.
 * **역할 분리**: 카메라 설정, 영상 파이프라인 초기화, 가중치 로드는 PS(C++)가 맡고, 캡처부터 추론, 차단바 제어까지의 실시간 흐름은 PL이 맡습니다.
