@@ -3,19 +3,21 @@ import time
 import sys
 import os
 import threading
+import traceback
+import numpy as np
 from datetime import datetime
 from flask import Flask, Response
 
 # 상위 디렉토리(python_code)를 import 경로에 추가
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from logic.B00_camera_input import get_camera
+from logic.B00_camera_input import get_camera, JPEG_PARAMS
 from logic.B01_car_detection import CarDetector, CONFIG as B01_CONFIG
 from logic.B02_car_mot import (
     CarMOT, CONFIG as B02_CONFIG,
-    car_number_fifo, enqueue_car_number, simulate_uart_rx
+    car_number_fifo, enqueue_car_number
 )
 from logic.C00_navigation import (
-    MarkerMapper, ParkingNavigator, CONFIG as C00_CONFIG, GATE_WORLD_POS
+    PillarMapper, ParkingNavigator, CONFIG as C00_CONFIG
 )
 from logic.C01_path_planner import (
     ParkingLotMap, RoutePlanner, CONFIG as C01_CONFIG
@@ -25,14 +27,43 @@ from logic.C01_path_planner import (
 # 각 모듈의 세부 설정은 해당 모듈의 CONFIG에서 관리.
 #   - 카메라     : B00_camera_input.py
 #   - 검출       : B01_car_detection.py  (모델 경로, conf, imgsz 등)
-#   - 추적       : B02_car_mot.py        (ByteTrack, FIFO 매칭 등)
-#   - 내비게이션 : C00_navigation.py     (ArUco 마커, 호모그래피, 안내 기준)
+#   - 추적       : B02_car_mot.py        (추적기 선택, FIFO 매칭 등)
+#                  실제 추적기는 config/*.yaml의 tracker_type이 결정한다.
+#                  현재 기본값: OC-SORT + ByteTrack 저신뢰 2차 연관 (config/ocsort.yaml)
+#   - 내비게이션 : C00_navigation.py     (기둥 보정, 좌표 변환, 안내 기준)
 # 여기서는 통합 실행에 필요한 설정만 관리.
 CONFIG = {
     # 카메라 설정
     "CAM_SENSOR_ID": 0,             # 카메라 장치 번호
-    "CAM_WIDTH": 640,               # 카메라 가로 해상도
-    "CAM_HEIGHT": 480,              # 카메라 세로 해상도
+    # 카메라 해상도.
+    #
+    # 조건이 두 개인데 서로 당긴다.
+    #
+    #   1) 주차장 전체가 화면에 들어와야 한다. (반드시)
+    #      안 들어오면 기둥을 찍을 수 없어 보정 자체가 안 된다.
+    #   2) 학습 데이터와 가로세로비가 같으면 좋다. (권장)
+    #      YOLO는 입력을 늘리지 않고 비율을 지킨 채 정사각(imgsz=640)에
+    #      레터박스한다. 그래서 비율이 다르면 모델이 배운 것과 다른 모양이
+    #      들어간다. 학습 데이터(yolo_dataset)는 640x640 안에 내용이
+    #      640x482로 들어 있는 4:3이고, 위아래 띠가 79px씩이다.
+    #        4:3   (640x480)  -> 내용 640x480, 띠  80px : 학습과 거의 같다
+    #        16:10 (1280x800) -> 내용 640x400, 띠 120px
+    #        16:9  (1280x720) -> 내용 640x360, 띠 140px
+    #
+    # 실측: 4:3으로 내렸더니 주차장 좌우가 잘렸다. 카메라가 4:3에서 센서를
+    # 잘라 쓰기 때문이다. 그래서 1)이 이긴다. 4:3보다 넓으면서 4:3에 가장
+    # 가까운 16:10을 쓴다. 이 값을 카메라가 안 받아주면 B00이 16:9로
+    # 자동으로 내려가고 그 사실을 로그에 남긴다. (B00의 FALLBACK_SIZES)
+    #
+    # 해상도 숫자 자체는 검출 성능과 거의 무관하다. 어떤 해상도든 프레임
+    # 가로가 텐서 640px로 매핑되므로, 화각이 같으면 텐서에서 보이는 차
+    # 크기는 똑같다. 차를 더 크게 보이게 하려면 해상도가 아니라 B01의
+    # IMGSZ를 올려야 한다. (그때는 엔진도 그 크기로 다시 export할 것)
+    #
+    # 이 값을 바꾸면 기둥 보정을 다시 해야 한다.
+    # config/pillar_pixels.json에 저장된 좌표가 이미지 픽셀이기 때문이다.
+    "CAM_WIDTH": 1280,              # 카메라 가로 해상도
+    "CAM_HEIGHT": 800,              # 카메라 세로 해상도
     "CAM_FPS": 30,                  # 카메라 프레임레이트
 
     # 웹 스트리밍 서버 설정
@@ -41,15 +72,53 @@ CONFIG = {
 
     # 차량번호 입력 소스 설정
     "ENABLE_UART": False,           # True: A00_uart_rx로 실제 Zybo UART 수신 (하드웨어 필요)
-    "TEST_PRESET_CAR_NUMBERS": ["1234", "1998", "0828", "9999"],  # UART 없이 테스트할 차량번호(순서대로 FIFO 등록)
-    "TEST_UART_SIMULATOR": False,   # True: 임의의 차량번호를 주기적으로 자동 생성
-    "TEST_UART_INTERVAL_SEC": 5.0,  # 자동 생성 주기(초)
+    # UART 없이 테스트할 차량번호는 data/car_data.py의 TEST_PRESET_CAR_NUMBERS에서 관리한다.
+    # 차량 종류 등록부(car_types)와 같은 곳에 두어야 어느 자리로 갈지 함께 볼 수 있다.
 
     # 내비게이션 연동 설정
     "AUTO_ASSIGN_SPOT": True,       # 차량번호 등록 시 A01_parking_manager로 빈자리를 자동 배정
-    "DRAW_MARKERS": True,           # 검출된 ArUco 마커를 화면에 표시
-    "DRAW_NAVIGATION": True,        # 목표 지점 안내선을 화면에 표시
+
+    # 등록된 배치(격자/기둥/자리/입출구)를 화면에 역투영해 겹쳐 그린다.
+    # 수동 보정이 제대로 됐는지 눈으로 확인하는 용도.
+    # 그려진 격자가 실제 매트 선과 겹쳐 보이면 좌표계가 맞은 것이다.
+    # 확인이 끝나면 꺼도 된다. (/overlay 로 실행 중에도 켜고 끌 수 있다)
+    "DRAW_LAYOUT_OVERLAY": True,
+    # 차에서 목적지까지 '직선'을 긋는다. [디버그]를 켠 상태에서만 나온다.
+    #
+    # 껐다. 이 선은 통로도 일방통행도 무시한 직선이라 주차 구역과 다른 차를
+    # 관통해 지나간다. 안내를 그렇게 하라는 뜻으로 읽히는데 실제 경로가 아니다.
+    # 진짜 경로는 3번 격자와 4번 화면이 그린다. (C01이 통로를 따라 계획한 것)
+    "DRAW_NAVIGATION": False,
+
+    # 일방통행 화살표를 영상 위에 겹쳐 그릴지.
+    #
+    # 껐다. 목업 바닥에 화살표가 이미 붙어 있어서 화면에 또 그리면 같은 것이
+    # 두 겹으로 보이고, 차 위를 지나가는 선이 박스를 가린다. 방향을 확인해야
+    # 하면 여기를 True로 두거나 /overlay 로 배치 오버레이째 켜면 된다.
+    "DRAW_ONE_WAY_ARROWS": False,
+
+    # 영상 좌상단 상태 글자(FPS / Tracks / FIFO / Map / 단계별 소요시간).
+    #
+    # 기본은 꺼둔다. 시연 화면에 늘 떠 있을 이유가 없고, 글자가 큰 데다
+    # 왼쪽 위 차량을 가린다. 점검할 때만 화면의 [디버그] 버튼이나
+    # /debug 로 켠다.
+    "DRAW_STATUS_TEXT": False,
+
+    # YOLO가 찾은 박스를 신뢰도와 함께 전부 얇게 그린다. (/rawdet 로 토글)
+    #
+    # 화면에 박스가 안 뜨는 차가 있을 때 이걸 켠다. 원인이 둘인데 손볼 곳이
+    # 완전히 다르기 때문이다.
+    #   얇은 박스도 없다        -> YOLO가 아예 못 본다. 모델/조명/각도 문제.
+    #   얇은 박스는 있는데 흐리다 -> 신뢰도가 ocsort.yaml의 new_track_thresh(0.4)에
+    #                             못 미쳐 트랙이 안 생긴 것. 임계값 문제.
+    # 이 구분을 눈으로 못 하면 '왜 저 차만 안 잡히지'에서 계속 막힌다.
+    "DRAW_RAW_DETECTIONS": False,
 }
+
+# 원본 검출 박스 색 (BGR). 추적 박스와 헷갈리지 않게 어둡게.
+COLOR_RAW_DET = (140, 140, 140)
+
+
 
 
 # 통합 파이프라인 (B + C)
@@ -61,8 +130,8 @@ class ParkingNavigationPipeline:
     각 단계는 독립 모듈로 분리되어 있고, 이 클래스는 연결만 담당한다.
       - B00_camera_input : 프레임 획득
       - B01_car_detection: YOLO 차량 검출 (모델은 여기 한 곳에서만 로드)
-      - B02_car_mot      : ByteTrack 추적 + FIFO 차량번호 매칭
-      - C00_navigation   : ArUco 마커 기반 실좌표 변환 + 경로 안내
+      - B02_car_mot      : MOT 추적(OC-SORT) + FIFO 차량번호 매칭
+      - C00_navigation   : 기둥 기반 좌표 변환 + 경로 안내 (C01 경로 계획 사용)
     """
 
     def __init__(self, cap, detector, mot, navigator):
@@ -74,7 +143,10 @@ class ParkingNavigationPipeline:
         # 최근 처리 결과 (다른 모듈/모니터링에서 조회 가능)
         self.latest_tracks = []
         self.latest_nav = []
+        self.latest_detections = 0      # 이번 프레임에 YOLO가 찾은 개수
         self.fps = 0.0
+        # 단계별 처리 시간(ms). FPS 원인 추적용. (/status의 stage_ms)
+        self.stage_ms = {}
 
     def process_frame(self, frame):
         """
@@ -86,59 +158,228 @@ class ParkingNavigationPipeline:
         Returns:
             (tracks, nav_results) 튜플
 
-        참고: 시각화 전에 내비게이션을 먼저 수행한다.
-              draw_tracks가 프레임에 박스를 그리고 나면 ArUco 마커 검출이
-              방해받을 수 있기 때문이다.
+        참고: 시각화 전에 내비게이션을 먼저 수행한다. 그려 넣은 박스가
+              다음 단계의 판단에 섞이지 않게 하기 위해서다.
         """
+        # 각 단계에 걸리는 시간을 잰다. FPS가 떨어졌을 때 어디가 원인인지
+        # 추측하지 않고 바로 알 수 있어야 한다. (/status의 stage_ms)
+        t = time.perf_counter()
+
         # 1) B01 : 차량 검출
         detections = self.detector.detect(frame)
+        # 검출 수를 따로 남긴다. 화면의 '검출 N대'는 사실 추적 수여서,
+        # 차가 안 보일 때 YOLO가 못 찾은 것인지 추적기가 트랙을 못 만든
+        # 것인지 구별할 수 없었다. 둘은 손봐야 할 곳이 다르다.
+        #   검출 > 추적 : 추적기 문제 (ocsort.yaml의 new_track_thresh 등)
+        #   검출 = 추적 : 검출 문제 (모델/조명/가림)
+        self.latest_detections = len(detections)
+        t_det = time.perf_counter()
 
-        # 2) B02 : ByteTrack 추적 + 차량번호 매칭
-        tracks = self.mot.update(detections)
+        # 2) B02 : MOT 추적 + 차량번호 매칭
+        #    B02의 판정 기준(이동량, 도착 반경, 주차 결합 반경)은 전부 cm를
+        #    전제로 잡혀 있다. 픽셀 거리를 그대로 넘기면 화면 위치마다 실제
+        #    거리가 달라 임계값을 하나로 정할 수 없다.
+        #    그래서 픽셀 좌표를 임의의 비율(1cm = 8px)로 줄여서 넘긴다.
+        #    실제 cm는 아니지만 화면 전체에서 같은 축척이라 비교는 성립한다.
+        #
+        #    target_of는 '주차 완료' 판정용이다. B02가 활성 차량의 위치와 목표
+        #    구역 좌표를 비교해 SINGLE_ACTIVE['ARRIVAL_RADIUS_CM'] 이내로
+        #    들어오면 안내를 종료하고 다음 차로 넘어간다.
+        #
+        #    parked_of는 '이미 그 자리에 세워져 있는 차'의 목록이다.
+        #    INITIAL_PARKED로 미리 세워둔 차와 안내를 마친 차가 여기 들어간다.
+        #    B02가 그 자리 근처의 트랙을 찾아 차량번호를 묶어주므로,
+        #    미리 세워둔 차가 'WAIT'로 뜨거나 안내 대상으로 잡히지 않는다.
+        #
+        #    보정 전에는 자리가 화면 어디인지 모르므로 빈 목록을 넘긴다.
+        #    None이 아니라 빈 목록인 것이 중요하다. B02는 parked_of를 받았는지
+        #    여부로 '이 호출자는 세워둔 차를 안다'를 판단하고, 좌표계가 설
+        #    때까지 FIFO에서 번호를 꺼내지 않는다. None을 넘기면 그 판단이
+        #    꺼져서, 세워둔 차가 흔들리는 것을 보고 번호를 채간다.
+        mapper = self.navigator.mapper
+        px_per_cm = 8.0
+
+        if mapper.pillar_pixels:
+            to_world_func = lambda p: (p[0] / px_per_cm, p[1] / px_per_cm)
+
+            def parked_of_func():
+                from data.car_data import cars_info
+                res = {}
+                for car, info in cars_info.items():
+                    if info.get("parked"):
+                        sp = mapper.spot_pixels.get(info.get("spot_id"))
+                        if sp:
+                            res[car] = (sp[0] / px_per_cm, sp[1] / px_per_cm)
+                return res
+
+            def free_spots_func():
+                """
+                차가 서 있지 않은 주차구역.
+
+                B02가 '오래 멈춘 차를 주차로 볼 것인가'를 가릴 때 쓴다.
+                주차를 마친 차가 차지한 자리만 뺀다. 배정만 되고 아직 오는 중인
+                자리는 남겨야 한다. 그 자리는 실제로 비어 있고, 안내받던 차가
+                제 자리에 늦게 도착한 경우도 여기서 걸러져야 하기 때문이다.
+                """
+                from data.car_data import cars_info
+                taken = {info.get("spot_id") for info in cars_info.values()
+                         if info.get("parked")}
+                return {spot_id: (sp[0] / px_per_cm, sp[1] / px_per_cm)
+                        for spot_id, sp in mapper.spot_pixels.items()
+                        if spot_id not in taken}
+        else:
+            to_world_func = None
+            parked_of_func = dict      # 보정 전 : 빈 목록
+            free_spots_func = dict
+
+        tracks = self.mot.update(
+            detections,
+            to_world=to_world_func,
+            target_of=self.navigator.get_target_rect,
+            parked_of=parked_of_func,
+            free_spots_of=free_spots_func
+        )
+        t_track = time.perf_counter()
 
         # 3) C00 : 배정된 목표 구역 동기화 후 위치 추정 및 경로 안내
         self.navigator.sync_targets_from_parking_manager()
+
+        # 안내 중이던 차가 출차했으면 활성 상태를 푼다.
+        # A01.remove_car가 cars_info에서 지우기만 하므로, 이걸 안 하면
+        # 이미 나간 차가 활성으로 남아 다음 차가 15초(STUCK_RELEASE_SEC)를
+        # 기다려야 번호를 받는다.
+        active = self.mot.active_car_id
+        if active is not None:
+            from data.car_data import cars_info
+            if active not in cars_info:
+                self.mot.release_car(active)
+
         nav_results = self.navigator.update(frame, tracks)
+        t_nav = time.perf_counter()
 
         # 4) 시각화
-        if CONFIG['DRAW_MARKERS']:
-            self.navigator.mapper.draw_markers(frame, self.navigator.latest_markers)
+        #    배치 오버레이를 가장 먼저 그린다. 차량 박스나 경로선에 가리지 않게.
+        if CONFIG['DRAW_LAYOUT_OVERLAY']:
+            self.navigator.mapper.draw_layout_overlay(
+                frame, show_flow=CONFIG['DRAW_ONE_WAY_ARROWS'])
+        # 원본 검출은 추적 박스 밑에 깔아야 한다. 위에 그리면 정상 추적 중인
+        # 차까지 회색 박스가 덧씌워져 화면을 읽을 수 없다.
+        if CONFIG['DRAW_RAW_DETECTIONS']:
+            self._draw_raw_detections(frame, detections)
         self.mot.draw_tracks(frame, tracks)
-        if CONFIG['DRAW_NAVIGATION']:
-            self.navigator.draw_navigation(frame, nav_results)
+        # 좌표 글자와 목적지 직선은 진단용이라 [디버그]를 켤 때만 나온다.
+        # (직선은 통로도 일방통행도 무시해서 주차 구역과 다른 차를 관통한다.
+        #  실제 안내 경로는 3번 격자와 4번 화면이 그린다)
+        if CONFIG['DRAW_STATUS_TEXT']:
+            self.navigator.draw_navigation(
+                frame, nav_results,
+                draw_target_line=CONFIG['DRAW_NAVIGATION'])
+
+        t_draw = time.perf_counter()
+        self.stage_ms = {
+            "detect": round((t_det - t) * 1000, 1),      # YOLO 추론
+            "track": round((t_track - t_det) * 1000, 1),  # 추적 + 번호 매칭
+            "nav": round((t_nav - t_track) * 1000, 1),    # 마커 검출 + 호모그래피 + 경로
+            "draw": round((t_draw - t_nav) * 1000, 1),    # 시각화
+        }
 
         self.latest_tracks = tracks
         self.latest_nav = nav_results
         return tracks, nav_results
 
+    def _draw_raw_detections(self, frame, detections):
+        """
+        YOLO 원본 박스를 신뢰도와 함께 얇게 그린다.
+
+        추적기가 걸러낸 저신뢰 박스까지 전부 보인다. 그래서 '박스가 없는 차'가
+        검출 자체를 못 한 것인지, 검출은 됐는데 신뢰도가 모자라 트랙이 안
+        생긴 것인지 화면만 보고 구별할 수 있다.
+        """
+        thresh = getattr(self.mot, 'new_track_thresh', None)
+        for det in detections:
+            x1, y1, x2, y2 = det["bbox"]
+            conf = det["confidence"]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_RAW_DET, 1)
+            # 신뢰도는 박스 아래에 적는다. 위는 추적 라벨이 쓴다.
+            label = f"{conf:.2f}"
+            if thresh is not None and conf < thresh:
+                label += " LOW"
+            cv2.putText(frame, label, (x1, y2 + 13),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_RAW_DET, 1, cv2.LINE_AA)
+
     def draw_status(self, frame):
-        """FPS, 추적 대수, FIFO 대기 수, 호모그래피 상태를 프레임에 표시."""
+        """
+        FPS, 추적 대수, FIFO 대기 수, 호모그래피 상태를 프레임에 표시.
+
+        CONFIG['DRAW_STATUS_TEXT']가 꺼져 있으면 아무것도 그리지 않는다.
+        같은 값들은 화면 아래 정보줄(E00)이 한글로 이미 보여주므로, 영상 위
+        글자는 점검할 때만 필요하다. [디버그] 버튼 또는 /debug로 켠다.
+        """
+        if not CONFIG['DRAW_STATUS_TEXT']:
+            return frame
+
         matched = sum(1 for t in self.latest_tracks if t["car_id"])
         mapper = self.navigator.mapper
-        ready = mapper.is_ready()
 
-        cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 30),
+        # 처리 FPS 옆에 카메라가 실제로 주는 fps와 버린 프레임 수를 함께 적는다.
+        # 이 둘이 벌어져 있으면(예: cam 30 / FPS 24) 화면이 밀리는 원인은
+        # 처리 속도이고, 붙어 있으면 카메라나 전송이 원인이다.
+        cam_txt = ""
+        cam = self.cap
+        if hasattr(cam, "capture_fps"):
+            cam_txt = f"  (cam {cam.capture_fps:.0f} / drop {cam.dropped})"
+        cv2.putText(frame, f"FPS: {self.fps:.1f}{cam_txt}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.putText(frame, f"Tracks: {len(self.latest_tracks)} (Matched: {matched})", (10, 65),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, f"FIFO Waiting: {self.mot.fifo.size()}", (10, 95),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
 
-        # 호모그래피 상태를 품질까지 함께 표시.
-        # 확정(LOCKED) 전에는 아직 좌표를 신뢰할 수 없다는 뜻이므로 구분해서 보여준다.
-        if not ready:
-            text, color = "Homography: NOT READY (show markers)", (0, 0, 255)
-        elif mapper.locked:
-            text = f"Homography: LOCKED ({mapper.calibrated_with} markers, {mapper.reproj_error:.1f}cm)"
+        # 보정 상태 표시
+        if mapper.pillar_pixels:
+            text = f"Map: CALIBRATED ({len(mapper.pillar_pixels)} pillars)"
             color = (0, 255, 0)
         else:
-            text = (f"Homography: PROVISIONAL ({mapper.calibrated_with}/{mapper.lock_markers} "
-                    f"markers, {mapper.reproj_error:.1f}cm)")
-            color = (0, 200, 255)
+            text = "Map: NOT CALIBRATED (open /calibrate)"
+            color = (0, 0, 255)
+
         cv2.putText(frame, text, (10, 125),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
+        # 단계별 소요 시간. FPS가 떨어졌을 때 어디를 손봐야 하는지 바로 보인다.
+        if self.stage_ms:
+            parts = "  ".join(f"{k} {v:.0f}ms" for k, v in self.stage_ms.items())
+            cv2.putText(frame, parts, (10, 152),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
         return frame
+
+    def _report_error(self, exc):
+        """프레임 처리 예외를 터미널에 한 번만 자세히 출력한다. (매 프레임 도배 방지)"""
+        key = f"{type(exc).__name__}: {exc}"
+        if key == getattr(self, "_last_error", None):
+            return
+        self._last_error = key
+        print(f"\n[ERROR] 프레임 처리 실패: {key}")
+        traceback.print_exc()
+
+    @staticmethod
+    def _error_frame(frame, exc):
+        """오류 내용을 적은 프레임을 MJPEG 청크로 만들어 반환."""
+        canvas = np.zeros_like(frame)
+        msg = f"{type(exc).__name__}: {exc}"
+        cv2.putText(canvas, "PIPELINE ERROR", (20, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 2, cv2.LINE_AA)
+        # 긴 메시지를 화면 폭에 맞춰 줄바꿈
+        for i in range(0, len(msg), 60):
+            cv2.putText(canvas, msg[i:i + 60], (20, 110 + (i // 60) * 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "see terminal for full traceback", (20, canvas.shape[0] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1, cv2.LINE_AA)
+
+        ok, buf = cv2.imencode('.jpg', canvas)
+        return (b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
 
     def generate_frames(self):
         """
@@ -154,7 +395,20 @@ class ParkingNavigationPipeline:
                 print("[ERROR] 카메라 프레임을 읽을 수 없습니다. 스트리밍을 종료합니다.")
                 break
 
-            tracks, nav_results = self.process_frame(frame)
+            # 카메라가 들고 있는 원본에 직접 그리지 않는다.
+            # /snapshot(보정 화면)이 같은 배열을 보기 때문이다.
+            frame = frame.copy()
+
+            # 처리 중 예외가 나면 제너레이터가 죽어 스트림이 조용히 끊긴다.
+            # 브라우저에는 깨진 이미지만 보여 원인을 알 수 없으므로,
+            # 오류를 화면에 그대로 띄우고 스트리밍은 유지한다.
+            try:
+                tracks, nav_results = self.process_frame(frame)
+            except Exception as exc:
+                self._report_error(exc)
+                yield self._error_frame(frame, exc)
+                time.sleep(0.5)
+                continue
 
             # FPS 계산 (0.5초 간격)
             current_time = time.time()
@@ -177,7 +431,7 @@ class ParkingNavigationPipeline:
                           f"목표={str(n['target_spot']):5s} 거리={dist:8s} 안내={n['guide_text']}")
 
             # JPEG 압축 후 웹 스트리밍 반환
-            ret, buffer = cv2.imencode('.jpg', frame)
+            ret, buffer = cv2.imencode('.jpg', frame, JPEG_PARAMS)
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
@@ -188,52 +442,57 @@ def register_car_number(car_id):
     """
     차량번호를 시스템에 등록.
 
-    AUTO_ASSIGN_SPOT이 True면 A01_parking_manager로 빈자리를 먼저 배정한 뒤
+    AUTO_ASSIGN_SPOT이 True면 A01_parking_manager로 자리를 먼저 배정한 뒤
     FIFO에 넣는다. 배정 정보(cars_info)가 있어야 C00이 목표 구역을 알 수 있다.
+
+    자리는 번호판에 등록된 차량 종류에 맞는 구역 중 입구에서 가장 가까운
+    빈자리로 배정된다. (등록부: data/car_data.py의 car_types)
+    해당 종류가 전부 차 있으면 배정에 실패하고, 그때는 안내를 시작하지 않는다.
 
     Args:
         car_id: 차량 번호 4자리 문자열
-    """
-    if CONFIG['AUTO_ASSIGN_SPOT']:
-        from logic.A01_parking_manager import handle_car_entry
-        handle_car_entry(car_id, datetime.now())
 
-    enqueue_car_number(car_id)
+    Returns:
+        A01.handle_car_entry의 결과 딕셔너리. AUTO_ASSIGN_SPOT이 False면 None.
+    """
+    if not CONFIG['AUTO_ASSIGN_SPOT']:
+        enqueue_car_number(car_id)
+        return None
+
+    from logic.A01_parking_manager import handle_car_entry
+    result = handle_car_entry(car_id, datetime.now())
+
+    # 배정 실패(해당 종류 자리가 다 참 등)면 추적 대기열에 넣지 않는다.
+    # 목표 구역이 없으면 C00이 안내할 곳도 없다.
+    if result["success"]:
+        enqueue_car_number(car_id)
+    else:
+        print(f"[등록] 안내를 시작하지 않습니다. ({result['reason']})")
+    return result
 
 
 def setup_car_number_source():
     """
     FIFO에 차량번호를 공급할 소스를 설정에 따라 준비.
-      - ENABLE_UART            : A00_uart_rx를 별도 스레드로 실행 (실제 Zybo 연동)
-      - TEST_PRESET_CAR_NUMBERS: 지정한 번호를 순서대로 미리 등록
-      - TEST_UART_SIMULATOR    : 임의 번호를 주기적으로 자동 생성
+      - ENABLE_UART : A00_uart_rx를 별도 스레드로 실행 (실제 Zybo 연동)
+      - 그 외       : car_data.TEST_PRESET_CAR_NUMBERS를 순서대로 등록
 
-    Returns:
-        시뮬레이터 종료용 threading.Event
+    UART를 켜면 테스트 번호는 넣지 않는다. 둘 다 넣으면 실제 입차와 테스트
+    번호가 뒤섞여 자리 배정과 FIFO 순서가 어긋난다.
     """
-    stop_event = threading.Event()
-
-    # 1) 실제 UART 수신 (A00_uart_rx)
-    #    A00은 내부에서 handle_car_entry와 enqueue_car_number를 모두 호출하므로
-    #    별도의 빈자리 배정이 필요 없다.
+    # 실제 UART 수신 (A00_uart_rx)
+    # A00은 내부에서 handle_car_entry와 enqueue_car_number를 모두 호출하므로
+    # 별도의 자리 배정이 필요 없다.
     if CONFIG['ENABLE_UART']:
         from logic.A00_uart_rx import uart_rx_main
         threading.Thread(target=uart_rx_main, daemon=True).start()
         print("[INFO] A00_uart_rx 수신 스레드를 시작했습니다.")
+        return
 
-    # 2) 미리 지정해 둔 차량번호를 순서대로 등록 (빈자리 배정 + FIFO)
-    for car_id in CONFIG['TEST_PRESET_CAR_NUMBERS']:
+    # 미리 지정해 둔 차량번호를 순서대로 등록 (차량 종류별 자리 배정 + FIFO)
+    from data.car_data import TEST_PRESET_CAR_NUMBERS
+    for car_id in TEST_PRESET_CAR_NUMBERS:
         register_car_number(car_id)
-
-    # 3) 가짜 UART 송신기 (임의 번호 자동 생성)
-    if CONFIG['TEST_UART_SIMULATOR']:
-        threading.Thread(
-            target=simulate_uart_rx,
-            args=(CONFIG['TEST_UART_INTERVAL_SEC'], stop_event),
-            daemon=True
-        ).start()
-
-    return stop_event
 
 
 def build_pipeline(cap):
@@ -254,24 +513,21 @@ def build_pipeline(cap):
         imgsz=B01_CONFIG['IMGSZ']
     )
 
-    # B02 : ByteTrack 추적기
+    # B02 : 추적기 (어떤 추적기인지는 TRACKER_CFG의 tracker_type이 결정)
+    # on_parked : 목표 구역 도착으로 안내가 끝나면 A01에 알린다.
+    #             cars_info의 parked가 True로 바뀌고, 이후 그 차는
+    #             '이미 주차된 차'로 취급되어 트랙이 끊겨도 자리로 다시 묶인다.
+    from logic.A01_parking_manager import mark_parked
+
     mot = CarMOT(
         tracker_cfg=B02_CONFIG['TRACKER_CFG'],
         min_hits=B02_CONFIG['MIN_HITS_FOR_ASSIGN'],
-        lost_ttl=B02_CONFIG['LOST_TTL_FRAMES'],
-        trajectory_maxlen=B02_CONFIG['TRAJECTORY_MAXLEN']
+        trajectory_maxlen=B02_CONFIG['TRAJECTORY_MAXLEN'],
+        on_parked=mark_parked
     )
 
-    # C00 : ArUco 마커 매퍼 + 내비게이터
-    mapper = MarkerMapper(
-        aruco_dict_name=C00_CONFIG['ARUCO_DICT'],
-        min_markers=C00_CONFIG['MIN_MARKERS_FOR_HOMOGRAPHY'],
-        lock_homography=C00_CONFIG['LOCK_HOMOGRAPHY'],
-        lock_markers=C00_CONFIG['MARKERS_FOR_LOCK'],
-        max_error=C00_CONFIG['MAX_REPROJ_ERROR_CM'],
-        min_spread=C00_CONFIG['MIN_MARKER_SPREAD'],
-        ransac_thresh_cm=C00_CONFIG['RANSAC_THRESH_CM']
-    )
+    # C00 : 기둥 매퍼 + 내비게이터
+    mapper = PillarMapper()
     navigator = ParkingNavigator(
         mapper=mapper,
         arrival_threshold=C00_CONFIG['ARRIVAL_THRESHOLD_CM'],
@@ -283,18 +539,84 @@ def build_pipeline(cap):
         replan_tolerance=C01_CONFIG['REPLAN_TOLERANCE_CM']
     )
 
-    # C01 : 경로 계획기 (주차 구역을 장애물로 두고 통로를 따라 경로 생성)
+    # C01 : 경로 계획기 (격자의 벽/기둥/주차구역을 장애물로 두고 통로를 따라 경로 생성)
     lot_map = ParkingLotMap(
-        navigator.spot_world_pos, GATE_WORLD_POS,
+        navigator.spot_world_pos,
         resolution=C01_CONFIG['GRID_RESOLUTION_CM'],
-        spot_w=C01_CONFIG['SPOT_W_CM'],
-        spot_h=C01_CONFIG['SPOT_H_CM'],
         clearance=C01_CONFIG['VEHICLE_CLEARANCE_CM'],
-        lot_margin=C01_CONFIG['LOT_MARGIN_CM'],
     )
     navigator.planner = RoutePlanner(lot_map, simplify=C01_CONFIG['SIMPLIFY_PATH'])
 
+    # 저장해 둔 기둥 보정을 불러온다.
+    #
+    # /calibrate가 config/pillar_pixels.json에 저장은 하고 있었는데 아무도
+    # 읽지 않아서, 실행할 때마다 기둥 10개를 다시 찍어야 했다.
+    #
+    # 단, 찍을 때의 해상도가 지금과 같을 때만 쓴다. 좌표가 이미지 픽셀이라
+    # 해상도가 달라지면 전부 어긋나는데, 그대로 불러 쓰면 화면은 멀쩡해
+    # 보이면서 자리 위치만 조용히 틀어진다. 그럴 바에는 다시 찍는 게 낫다.
+    # 다시 찍으려면 /calibrate, 저장된 것을 지우려면 /recalibrate.
+    _load_saved_calibration(navigator, getattr(cap, "frame_size", None))
+
     return ParkingNavigationPipeline(cap, detector, mot, navigator)
+
+
+def _load_saved_calibration(navigator, frame_size):
+    """
+    저장된 기둥 보정을 검사해서 쓸 수 있으면 적용한다.
+
+    Args:
+        navigator:  ParkingNavigator
+        frame_size: 지금 카메라가 실제로 주는 (가로, 세로). 모르면 None.
+
+    Returns:
+        적용했으면 True.
+    """
+    from logic.B03_map_setting import load_pillar_pixels
+
+    saved = load_pillar_pixels()
+    if not saved:
+        print("[INFO] 저장된 기둥 보정이 없습니다. "
+              "/calibrate 에서 기둥을 찍어주세요.")
+        return False
+
+    points = saved["points"]
+    saved_size = (saved["width"], saved["height"])
+
+    if saved_size == (None, None):
+        print("[경고] 저장된 기둥 보정에 해상도 기록이 없습니다. "
+              "(해상도를 적기 전에 저장된 파일)")
+        print("       지금 화면과 맞는지 알 수 없어 쓰지 않습니다. "
+              "/calibrate 에서 다시 찍어주세요.")
+        return False
+
+    if frame_size is not None and tuple(saved_size) != tuple(frame_size):
+        print(f"[경고] 저장된 기둥 보정은 {saved_size[0]}x{saved_size[1]}에서 "
+              f"찍은 것인데 지금 카메라는 {frame_size[0]}x{frame_size[1]}입니다.")
+        print("       좌표가 이미지 픽셀이라 그대로 쓰면 자리가 전부 어긋납니다. "
+              "/calibrate 에서 다시 찍어주세요.")
+        return False
+
+    # 화면 방향이 바뀌었으면 해상도는 그대로라 위 검사에 걸리지 않는다.
+    # 그대로 쓰면 화면은 멀쩡한데 자리 좌표만 통째로 뒤집힌 채 돈다.
+    from logic.B00_camera_input import FRAME_ORIENTATION
+    if saved.get("orientation") != FRAME_ORIENTATION:
+        print(f"[경고] 저장된 기둥 보정은 화면 방향 "
+              f"'{saved.get('orientation')}'에서 찍은 것인데 "
+              f"지금 설정은 '{FRAME_ORIENTATION}'입니다.")
+        print("       해상도는 같아도 좌표가 전부 어긋납니다. "
+              "/calibrate 에서 다시 찍어주세요.")
+        return False
+
+    ok, msg = navigator.mapper.set_pillar_pixels(points)
+    if not ok:
+        print(f"[경고] 저장된 기둥 보정을 쓸 수 없습니다: {msg}")
+        return False
+
+    navigator.update_spot_pixels()
+    print(f"[INFO] 저장된 기둥 보정을 불러왔습니다. "
+          f"(기둥 {len(points)}개, {saved_size[0]}x{saved_size[1]})")
+    return True
 
 
 def open_camera():
@@ -311,15 +633,30 @@ def open_camera():
 
 def build_status(pipeline):
     """현재 추적/내비게이션 상태를 JSON 직렬화 가능한 딕셔너리로 반환."""
+    import logic.A01_parking_manager as pm
+
     mapper = pipeline.navigator.mapper
+
+    # 가장 최근 입차 시도 결과. 실패했다면 "자리 없음" 안내 화면이 이 값을 쓴다.
+    last_entry = pm.last_entry_result
+    if last_entry is not None:
+        last_entry = {k: v for k, v in last_entry.items() if k != "time"}
+
+    cam = pipeline.cap
     return {
         "fps": round(pipeline.fps, 1),
-        "homography_ready": mapper.is_ready(),
-        "homography_locked": mapper.locked,
-        "homography_markers": mapper.calibrated_with,
-        "homography_error_cm": (round(mapper.reproj_error, 2)
-                                if mapper.is_ready() else None),
-        "markers_detected": sorted(pipeline.navigator.latest_markers.keys()),
+        # 카메라가 실제로 주는 fps와, 처리가 못 따라가 버린 프레임 수.
+        # fps보다 camera_fps가 크면 그 차이만큼 프레임을 버리고 있다는 뜻이다.
+        "camera_fps": round(getattr(cam, "capture_fps", 0.0), 1),
+        "dropped_frames": getattr(cam, "dropped", 0),
+        "stage_ms": pipeline.stage_ms,
+        "last_entry": last_entry,
+        "availability": {
+            info["name"]: f"{info['empty']}/{info['total']}"
+            for info in pm.get_availability_by_type().values()
+        },
+        "calibrated": mapper.is_ready(),
+        "pillars": len(mapper.pillar_pixels),
         "fifo_waiting": car_number_fifo.snapshot(),
         "vehicles": [
             {
@@ -353,7 +690,7 @@ if __name__ == '__main__':
     pipeline = build_pipeline(cap)
 
     # 차량번호 입력 소스 준비 (UART 또는 테스트용)
-    uart_sim_stop = setup_car_number_source()
+    setup_car_number_source()
 
     app = Flask(__name__)
 
@@ -364,10 +701,15 @@ if __name__ == '__main__':
             <head><title>Jetson Parking Navigation (C_main)</title></head>
             <body style="background-color: #222; color: white; text-align: center;">
                 <h2>Jetson Orin Nano - Parking Navigation Pipeline</h2>
-                <p>B00(Camera) -&gt; B01(Detection) -&gt; B02(ByteTrack MOT) -&gt; C00(Navigation)</p>
+                <p>B00(Camera) -&gt; B01(Detection) -&gt; B02({pipeline.mot.tracker_type.upper()} MOT) -&gt; C00(Navigation)</p>
                 <img src="/video_feed" width="{CONFIG['CAM_WIDTH']}" height="{CONFIG['CAM_HEIGHT']}">
                 <p>차량번호 수동 등록: <code>/enqueue/1234</code> | 현재 상태: <code>/status</code></p>
-                <p>호모그래피 재계산: <code>/recalibrate</code></p>
+                <p>호모그래피 재계산: <code>/recalibrate</code>
+                   | 구역별 빈자리: <code>/availability</code>
+                   | 배치 오버레이: <code>/overlay</code></p>
+                <p style="color:#ffd24d">마커가 잘 안 잡히면
+                   <a href="/calibrate" style="color:#ffd24d">기둥 수동 보정</a>
+                   에서 기둥을 직접 찍어 좌표계를 확정하세요. (카메라 고정 시 1회만)</p>
             </body>
         </html>
         """
@@ -379,14 +721,61 @@ if __name__ == '__main__':
 
     @app.route('/enqueue/<car_id>')
     def enqueue(car_id):
-        """UART 없이 차량번호를 등록하기 위한 라우트. (빈자리 배정 포함)"""
-        register_car_number(car_id)
-        return f"등록: {car_id} (대기 {car_number_fifo.size()}대) / 현재 큐: {car_number_fifo.snapshot()}"
+        """UART 없이 차량번호를 등록하기 위한 라우트. (자리 배정 포함)"""
+        result = register_car_number(car_id)
+        if result is None:
+            return f"등록: {car_id} (대기 {car_number_fifo.size()}대) / 큐: {car_number_fifo.snapshot()}"
+        return {
+            "car_id": car_id,
+            "car_type": result["car_type"],
+            "assigned": result["success"],
+            "spot_id": result["spot_id"],
+            "reason": result["reason"],
+            "message": result["message"],
+            "fifo": car_number_fifo.snapshot(),
+        }
+
+    @app.route('/availability')
+    def availability():
+        """
+        구역 종류별 빈자리 현황. ("자리 없음" 안내 화면이 쓸 데이터)
+
+        예: {"대형": {"empty": 0, "total": 6, "spots": []}, ...}
+        """
+        from logic.A01_parking_manager import get_availability_by_type
+        return {
+            info["name"]: {k: v for k, v in info.items() if k != "name"}
+            for info in get_availability_by_type().values()
+        }
 
     @app.route('/status')
     def status():
         """현재 추적/내비게이션 상태와 FIFO 대기열을 조회."""
         return build_status(pipeline)
+
+    @app.route('/overlay')
+    @app.route('/overlay/<state>')
+    def overlay(state=None):
+        """배치 역투영 오버레이를 켜고 끈다. (/overlay/on, /overlay/off, /overlay)"""
+        if state == 'on':
+            CONFIG['DRAW_LAYOUT_OVERLAY'] = True
+        elif state == 'off':
+            CONFIG['DRAW_LAYOUT_OVERLAY'] = False
+        else:
+            CONFIG['DRAW_LAYOUT_OVERLAY'] = not CONFIG['DRAW_LAYOUT_OVERLAY']
+        return f"배치 오버레이: {'ON' if CONFIG['DRAW_LAYOUT_OVERLAY'] else 'OFF'}"
+
+    @app.route('/rawdet')
+    @app.route('/rawdet/<state>')
+    def rawdet(state=None):
+        """YOLO 원본 검출 박스 표시를 켜고 끈다. (/rawdet/on, /rawdet/off, /rawdet)"""
+        if state == 'on':
+            CONFIG['DRAW_RAW_DETECTIONS'] = True
+        elif state == 'off':
+            CONFIG['DRAW_RAW_DETECTIONS'] = False
+        else:
+            CONFIG['DRAW_RAW_DETECTIONS'] = not CONFIG['DRAW_RAW_DETECTIONS']
+        return f"원본 검출 표시: {'ON' if CONFIG['DRAW_RAW_DETECTIONS'] else 'OFF'}"
 
     @app.route('/recalibrate')
     def recalibrate():
@@ -394,10 +783,23 @@ if __name__ == '__main__':
         pipeline.navigator.mapper.reset()
         return "호모그래피를 초기화했습니다. 마커가 보이면 자동으로 재계산됩니다."
 
+    # --- 수동 보정 -------------------------------------------------------
+    # 마커가 작거나 흐려 자동 검출이 잘 안 될 때, 화면에서 기둥을 직접 찍어
+    # 좌표계를 확정한다. 카메라가 고정이면 한 번만 하면 되고 캐시에 저장된다.
+    from logic.B03_map_setting import register_map_routes
+    import logic.B00_camera_input as b00_camera_input
+    register_map_routes(app, pipeline, cap_module=b00_camera_input)
+
     print(f"\n[INFO] Flask 웹 서버를 시작합니다. http://젯슨IP:{CONFIG['WEB_PORT']}/ 으로 접속하세요.")
     try:
-        app.run(host=CONFIG['WEB_HOST'], port=CONFIG['WEB_PORT'], debug=False)
+        # threaded=True를 명시한다. 이 화면은 영상 두 개를 MJPEG로 계속
+        # 흘려보내는데, 한 번에 하나만 처리하는 서버라면 그 스트림이 서버를
+        # 통째로 붙들어 나머지 요청이 영영 응답하지 않는다. 브라우저에서는
+        # 페이지가 안 열리고 로딩만 도는 것으로 보인다.
+        # (Flask 1.0부터 기본값이 True지만, 젯슨에 apt로 깔린 옛 버전은
+        #  False라서 실제로 이 증상이 난다)
+        app.run(host=CONFIG['WEB_HOST'], port=CONFIG['WEB_PORT'],
+                debug=False, threaded=True)
     finally:
-        uart_sim_stop.set()
         cap.release()
         print("[INFO] 카메라를 해제하고 종료합니다.")

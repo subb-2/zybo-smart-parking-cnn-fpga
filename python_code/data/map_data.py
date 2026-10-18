@@ -1,119 +1,409 @@
 # 주차장 맵 데이터 정의
 # 순수 데이터(그리드, 좌표, 상수)만 관리.
-# 로직(BFS, 경로 탐색 등)은 logic/path_finder.py에서 처리.
-
-# 셀 타입 상수 정의
-WALL  = 0  # 벽 (이동 불가 영역, 경계선, 중앙 섬 내부)
-ROAD  = 1  # 도로 (차량이 이동 가능한 통로)
-SPOT  = 2  # 주차 구역 (빈자리/주차중 구분)
-GATE  = 3  # 입출구 (입구와 출구가 같은 위치)
-
-# 주차장 그리드 맵 정의 (15행 × 13열)
-# 맵 구조 설명:
-# - row  0       : 상단 외벽
-# - row  1       : A구역 주차칸 (A-1 ~ A-5)
-# - row  2       : A구역 앞 도로
-# - row  3 ~ 4   : 상단 도로 (입출구 포함)
-# - row  5       : 중앙 섬 상단 도로
-# - row  6       : C구역 주차칸 (C-1 ~ C-3)
-# - row  7       : 중앙 섬 내부 벽
-# - row  8       : D구역 주차칸 (D-1 ~ D-3)
-# - row  9       : 중앙 섬 하단 도로
-# - row 10 ~ 11  : 하단 도로
-# - row 12       : B구역 앞 도로
-# - row 13       : B구역 주차칸 (B-1 ~ B-5)
-# - row 14       : 하단 외벽
+#   - 실좌표(cm) 변환 : logic/C02_lot_layout.py
+#   - 경로 계산       : logic/C01_path_planner.py
+#
 # =====================================================================
+# 이 파일에서 사람이 손으로 고치는 것은 딱 두 가지다.
+#   1) grid_map      : 주차장 배치 (설계도)
+#   2) PILL_MARKER_ID: 기둥 번호 (물리 배치라 자동화 불가)
+#
+# spot_map / coord_to_spot / spot_type / spot_status / GATE1_POS / GATE2_POS는
+# 전부 grid_map에서 자동으로 만들어진다. 예전에는 이것들을 따로 적어두었는데,
+# grid_map만 고치고 나머지를 안 고쳐서 조용히 어긋나는 사고가 났다.
+# 배치를 바꾸려면 grid_map만 고치고 C02_lot_layout.py를 단독 실행해 검증할 것.
+# =====================================================================
+
+# 셀 타입 상수
+ROAD  = 0  # 도로 (차량이 이동 가능한 통로)
+PILL  = 1  # 기둥
+GATE1 = 2  # 입구
+GATE2 = 3  # 출구
+SPOT1 = 4  # 일반 주차 구역
+SPOT2 = 5  # 장애인 주차 구역
+SPOT3 = 6  # 대형 주차 구역
+SPOT4 = 7  # 전기차 주차 구역
+
+
+# 주차 구역으로 취급할 셀 타입 전체.
+# 주차 구역 종류가 늘어나면 상수를 추가하고 이 집합과 SPOT_TYPE_NAME에도 넣을 것.
+# 코드에서 '주차 구역인가'를 판정할 때는 반드시 이 집합을 쓴다.
+# (cell == SPOT1 처럼 하나만 비교하면 나머지 종류가 통째로 누락된다)
+SPOT_CELLS = {SPOT1, SPOT2, SPOT3, SPOT4}
+
+# 주차 구역 종류 이름 (UI 표시 / 로그용)
+SPOT_TYPE_NAME = {
+    SPOT1: "일반",
+    SPOT2: "장애인",
+    SPOT3: "대형",
+    SPOT4: "전기차",
+}
+
+# 주차 구역 '한 자리'가 차지하는 격자 칸 수 (세로 방향).
+#
+# 대형차는 차체가 길어서 한 자리가 세로 2칸을 차지한다. 격자에는 SPOT3가
+# 2칸으로 그려져 있지만 실제로는 '1자리'다.
+# 이 표에 따라 같은 열에서 연속된 같은 종류 칸들을 자리 하나로 묶는다.
+#
+# 예) col 0의 row 4, 5가 모두 SPOT3 -> 두 칸을 묶어 대형 1자리 (A-3)
+#     col 0의 row 1, 2가 모두 SPOT1 -> span이 1이므로 각각 별개 자리 (A-1, A-2)
+#
+# 종류를 추가하면 여기에도 넣을 것. 없으면 1로 취급한다.
+SPOT_CELL_SPAN = {
+    SPOT1: 1,
+    SPOT2: 1,
+    SPOT3: 2,   # 대형차 1자리 = 세로 2칸
+    SPOT4: 1,
+}
+
+
+# 주차장 그리드 맵 (9행 x 13열)
+# 구조:
+#   - 바깥 양쪽 열(col 0 = 왼쪽, col 12 = 오른쪽)에 주차 구역이 늘어서 있다.
+#     왼쪽 열 : 일반 2 + 대형 1(row 4~5를 묶어 1자리) + 장애인 1  = 4자리
+#     오른쪽 열: 전부 일반                                        = 5자리
+#   - 가운데 col 5 / col 7은 중앙 섬 두 개. 각각 기둥 2개 사이에 전기차 구역 2칸.
+#   - 그 사이(col 1~3, 5~6, 8~10)와 맨 아랫줄(row 8)이 전부 도로다.
+#   - 입구(GATE1)는 아래 오른쪽(row 8, col 8), 출구(GATE2)는 아래 왼쪽(row 8, col 4).
+#     열이 13개(0~12)이므로 가운데는 col 6이고, 두 문이 그 양옆으로 두 칸씩
+#     떨어져 마주 본다. 실물 목업이 그렇게 대칭이다.
+#     입구로 들어와 안쪽을 돌고 왼쪽 아래 출구로 빠지는 흐름이 된다.
+#
+# 기둥과 주차 구역의 관계:
+#   자리의 실좌표는 '같은 열에 있는 기둥들'을 기준으로 보간해서 구한다.
+#   따라서 주차 구역이 있는 열에는 기둥이 최소 2개 있어야 한다.
+#   기둥 사이에 자리가 몇 칸이 들어가든(현재는 2칸씩) 상관없고,
+#   마지막 기둥 바깥의 자리(예: row 7)는 외삽으로 처리된다.
+#   자세한 계산은 logic/C02_lot_layout.py의 build_spot_world_pos 참고.
+# 열 배분은 실측에 맞춘 것이다. (기둥 중심 사이 거리, CELL_W_CM = 10cm 기준)
+#   왼쪽 열(c0) <-> 왼쪽 섬(c5)    = 5칸 = 50cm
+#   왼쪽 섬(c5) <-> 오른쪽 섬(c7)  = 2칸 = 20cm
+#   오른쪽 섬(c7) <-> 오른쪽 열(c12) = 5칸 = 50cm
+#   전체 폭 (c0 <-> c12)           = 12칸 = 120cm
+# 실물 치수가 바뀌면 이 배분과 C02의 CELL_W_CM을 함께 고칠 것.
 grid_map = [
-    # col: 0     1     2     3     4     5     6     7     8     9    10    11    12
-    [WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL],  # row 0  : 상단 외벽
-    [WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL],  # row 1  : A구역 (A-1 ~ A-5, 각 2칸 폭)
-    [WALL, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, WALL],  # row 2  : A구역 앞 도로
-    [GATE, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, WALL],  # row 3  : 입출구 + 도로
-    [WALL, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, WALL],  # row 4  : 도로
-    [WALL, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, WALL],  # row 5  : 중앙 섬 상단 도로
-    [WALL, ROAD, ROAD, WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL],  # row 6  : C구역 (C-1 ~ C-3, 각 2칸 폭)
-    [WALL, ROAD, ROAD, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL],  # row 7  : 중앙 섬 내부 벽
-    [WALL, ROAD, ROAD, WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL],  # row 8  : D구역 (D-1 ~ D-3, 각 2칸 폭)
-    [WALL, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, WALL],  # row 9  : 중앙 섬 하단 도로
-    [WALL, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, WALL],  # row 10 : 도로
-    [WALL, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, WALL],  # row 11 : 도로
-    [WALL, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, ROAD, WALL],  # row 12 : B구역 앞 도로
-    [WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL, SPOT, SPOT, WALL],  # row 13 : B구역 (B-1 ~ B-5, 각 2칸 폭)
-    [WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL, WALL],  # row 14 : 하단 외벽
+    # col: 0       1       2       3       4       5       6       7       8       9      10      11      12
+        [PILL   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,PILL],  # row 0
+        [SPOT1  ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,SPOT1],  # row 1
+        [SPOT1  ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,PILL   ,ROAD   ,PILL   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,SPOT1],  # row 2
+        [PILL   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,SPOT4  ,ROAD   ,SPOT4  ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,PILL],  # row 3
+        [SPOT3  ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,SPOT4  ,ROAD   ,SPOT4  ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,SPOT1],  # row 4
+        [SPOT3  ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,PILL   ,ROAD   ,PILL   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,SPOT1],  # row 5
+        [PILL   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,PILL],  # row 6
+        [SPOT2  ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD   ,ROAD ],  # row 7
+        [ROAD   ,ROAD   ,ROAD   ,ROAD   ,GATE2  ,ROAD   ,ROAD   ,ROAD   ,GATE1  ,ROAD   ,ROAD   ,ROAD   ,ROAD],  # row 8
 ]
 
-# =====================================================================
-# 주차 구역 좌표 매핑
-# (row, col) 좌표 리스트 -> 주차 구역 ID
-# 각 주차 구역은 2칸 폭으로 구성됨
-# =====================================================================
-spot_map = {
-    "A-1": [(1, 1),  (1, 2)],
-    "A-2": [(1, 4),  (1, 5)],
-    "A-3": [(1, 7),  (1, 8)],
-    "A-4": [(1, 10), (1, 11)],
-    # A-5는 맵 크기 제한으로 A-4까지만 반영 (필요시 열 확장)
-    
-    "B-1": [(13, 1),  (13, 2)],
-    "B-2": [(13, 4),  (13, 5)],
-    "B-3": [(13, 7),  (13, 8)],
-    "B-4": [(13, 10), (13, 11)],
-    # B-5도 마찬가지
-    
-    "C-1": [(6, 4),  (6, 5)],
-    "C-2": [(6, 7),  (6, 8)],
-    "C-3": [(6, 10), (6, 11)],
-    
-    "D-1": [(8, 4),  (8, 5)],
-    "D-2": [(8, 7),  (8, 8)],
-    "D-3": [(8, 10), (8, 11)],
+# 기둥(PILL) -> 기둥 번호 매핑
+#
+# 이것은 물리 정보다. 보정(/calibrate)에서 이 순서대로 기둥을 클릭한다.
+# 예전에는 기둥에 붙인 ArUco 마커 ID였고 카메라가 자동으로 읽었다.
+# 지금은 사람이 직접 찍으므로 '몇 번째로 찍을 기둥인가'를 뜻한다.
+# 이 표만은 자동으로 만들 수 없다. 목업의 어느 기둥에 몇 번 마커를 붙였는지는
+# 코드가 알 수 없기 때문이다. 마커를 옮기거나 다시 인쇄하면 반드시 함께 고칠 것.
+#
+# 이 표가 격자(설계도)와 실제 카메라 영상을 잇는 유일한 연결 고리다.
+# 마커의 실좌표(cm)는 logic/C02_lot_layout.py가 이 표를 보고 만든다.
+#
+# 배정 규칙: '왼쪽 열 -> 중앙 섬 좌 -> 중앙 섬 우 -> 오른쪽 열',
+#            각 열 안에서는 입출구에서 '먼' 쪽(row 0)부터 1, 2, 3...
+#
+# ---------------------------------------------------------------------
+# 실물 부착표 (이 표대로 기둥에 마커를 붙일 것)
+#
+#   방향 기준: row 8이 입출구가 있는 줄이다. 즉 row 0이 입출구에서 가장 먼 쪽.
+#             카메라가 입출구 쪽에서 본다면 화면 '위'가 row 0이다.
+#
+#   마커ID   기둥 격자     실좌표(cm)      위치
+#   ------------------------------------------------------
+#     1     (0,  0)      (  0.0,   0.0)   왼쪽 열   · 맨 위
+#     2     (3,  0)      (  0.0,  52.5)   왼쪽 열   · 가운데
+#     3     (6,  0)      (  0.0, 105.0)   왼쪽 열   · 맨 아래
+#     4     (2,  5)      ( 50.0,  35.0)   중앙 섬 좌 · 위
+#     5     (5,  5)      ( 50.0,  87.5)   중앙 섬 좌 · 아래
+#     6     (2,  7)      ( 70.0,  35.0)   중앙 섬 우 · 위
+#     7     (5,  7)      ( 70.0,  87.5)   중앙 섬 우 · 아래
+#     8     (0, 12)      (120.0,   0.0)   오른쪽 열 · 맨 위
+#     9     (3, 12)      (120.0,  52.5)   오른쪽 열 · 가운데
+#    10     (6, 12)      (120.0, 105.0)   오른쪽 열 · 맨 아래
+#
+#          c0          c5      c7            c12
+#    r0   (1)                                (8)      <- 입출구에서 먼 쪽
+#    r2              (4)     (6)
+#    r3   (2)                                (9)
+#    r5              (5)     (7)
+#    r6   (3)                                (10)
+#    r8         출구 c3            입구 c8            <- 입출구가 있는 줄
+#
+#   실측 (기둥 중심 사이)
+#     1 <-> 4   50cm    1 <-> 8   120cm
+#     4 <-> 6   20cm    1 <-> 3   105cm
+#     6 <-> 8   50cm
+#
+#   실좌표는 CELL_W_CM / CELL_H_CM(C02_lot_layout.CONFIG)에서 계산된 값이다.
+#   10.0 x 17.5cm 기준으로 주차장이 120 x 105cm가 된다.
+#   실제 목업 치수가 다르면 그 CONFIG와 위 열 배분을 함께 고칠 것.
+#
+#   11~13번 등 이 표에 없는 마커는 주차장에서 치울 것. 남아 있으면 검출은
+#   되지만 호모그래피에 쓰이지 않아 화면에 빨간 점 + "11?"로 계속 뜬다.
+# ---------------------------------------------------------------------
+PILL_MARKER_ID = {
+    (0, 0): 1,  (3, 0): 2,  (6, 0): 3,
+    (2, 5): 4,  (5, 5): 5,
+    (2, 7): 6,  (5, 7): 7,
+    (0, 12): 8, (3, 12): 9, (6, 12): 10,
 }
 
-# 역방향 매핑: 좌표 -> 주차 구역 ID (빠른 검색용)
-coord_to_spot = {}
-for spot_id, coords in spot_map.items():
-    for coord in coords:
-        coord_to_spot[coord] = spot_id
+# 역방향 매핑: 마커 ID -> 격자 좌표
+MARKER_ID_CELL = {mid: cell for cell, mid in PILL_MARKER_ID.items()}
 
-# 입출구 좌표
-GATE_POS = (3, 0)
 
 # =====================================================================
-# 주차 구역 상태 (초기 상태를 직접 설정)
+# 주차 구역 자동 생성 (grid_map에서 유도)
 # =====================================================================
-# 각 구역의 점유 여부를 "empty" 또는 "full" 로 직접 지정하세요.
-# 예: 이미 주차되어 있는 자리는 "full", 비어있는 자리는 "empty"
-# {
-#     "A-1": "empty",
-#     "A-2": "full",
-#     ...
-# }
-spot_status = {
-    "A-1": "empty",
-    "A-2": "empty",
-    "A-3": "empty",
-    "A-4": "empty",
-    "A-5": "empty",
+# 구역 ID 규칙: "<구역문자>-<번호>"
+#   구역문자 : 주차 구역이 있는 열을 왼쪽부터 A, B, C, D ... 로 매긴다.
+#   번호     : 같은 열 안에서 위(row 0)부터 1, 2, 3 ...
+#
+# 현재 배치에서는 이렇게 나온다.
+#   A = col 0 (왼쪽)   B = col 5 (중앙 섬 좌)
+#   C = col 7 (중앙 섬 우)   D = col 12 (오른쪽)
+#
+# 주의: 열을 추가/삭제하면 구역 문자가 통째로 밀린다. (예전 A-1이 B-1이 된다)
+#       주차 중인 차가 있는 상태로 배치를 바꾸지 말 것.
+_ZONE_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-    "B-1": "empty",
-    "B-2": "empty",
-    "B-3": "empty",
-    "B-4": "empty",
-    "B-5": "empty",
 
-    "C-1": "empty",
-    "C-2": "empty",
-    "C-3": "empty",
-    "C-4": "empty",
-    "C-5": "empty",
+def _build_spot_tables():
+    """
+    grid_map을 훑어 주차 구역 관련 표를 한 번에 만든다.
 
-    "D-1": "empty",
-    "D-2": "empty",
-    "D-3": "empty",
-    "D-4": "empty",
-    "D-5": "empty",
+    Returns:
+        (spot_map, coord_to_spot, spot_type)
+        spot_map     : {구역ID: [(row, col), ...]}
+        coord_to_spot: {(row, col): 구역ID}
+        spot_type    : {구역ID: SPOT1..SPOT4}
+    """
+    # 주차 구역이 있는 열을 왼쪽부터 모은다
+    spot_cols = sorted({
+        col
+        for row in range(len(grid_map))
+        for col in range(len(grid_map[0]))
+        if grid_map[row][col] in SPOT_CELLS
+    })
+
+    rows_n = len(grid_map)
+    spot_map, coord_to_spot, spot_type = {}, {}, {}
+
+    for zone_index, col in enumerate(spot_cols):
+        letter = _ZONE_LETTERS[zone_index % len(_ZONE_LETTERS)]
+        number = 0
+        row = 0
+        while row < rows_n:
+            cell = grid_map[row][col]
+            if cell not in SPOT_CELLS:
+                row += 1
+                continue
+
+            # SPOT_CELL_SPAN만큼 같은 종류가 연속되면 한 자리로 묶는다.
+            # (대형차는 2칸이 1자리)
+            span = SPOT_CELL_SPAN.get(cell, 1)
+            cells = [(row, col)]
+            next_row = row + 1
+            while len(cells) < span and next_row < rows_n and grid_map[next_row][col] == cell:
+                cells.append((next_row, col))
+                next_row += 1
+
+            if len(cells) < span:
+                print(f"[경고] ({row}, {col})의 {SPOT_TYPE_NAME.get(cell, cell)} 구역은 "
+                      f"{span}칸이 필요한데 {len(cells)}칸만 연속됩니다. "
+                      f"grid_map을 확인하세요.")
+
+            number += 1
+            spot_id = f"{letter}-{number}"
+            spot_map[spot_id] = cells
+            for coord in cells:
+                coord_to_spot[coord] = spot_id
+            spot_type[spot_id] = cell
+
+            row = next_row      # 묶은 칸들은 건너뛴다
+
+    return spot_map, coord_to_spot, spot_type
+
+
+def _find_cell(cell_type):
+    """grid_map에서 해당 타입의 첫 칸 좌표를 찾는다. 없으면 None."""
+    for row in range(len(grid_map)):
+        for col in range(len(grid_map[0])):
+            if grid_map[row][col] == cell_type:
+                return (row, col)
+    return None
+
+
+# 구역ID -> [(row, col)]  /  (row, col) -> 구역ID  /  구역ID -> 셀 타입
+spot_map, coord_to_spot, spot_type = _build_spot_tables()
+
+# 입출구 좌표 (grid_map의 GATE1 / GATE2 칸에서 자동 추출)
+GATE1_POS = _find_cell(GATE1)   # 입구
+GATE2_POS = _find_cell(GATE2)   # 출구
+
+
+# =====================================================================
+# 일방통행 순환 (반시계)
+# =====================================================================
+# 이 주차장은 통로가 한 방향으로만 돈다. 바닥에 붙인 화살표가 그 방향이다.
+#
+#   입구(row 8, col 8)로 들어와 -> 아랫줄을 오른쪽으로
+#   -> 오른쪽 통로를 위로   (D-4 -> D-3 -> D-2 -> D-1)
+#   -> 윗줄을 왼쪽으로
+#   -> 왼쪽 통로를 아래로   (A-1 -> A-2 -> A-3 -> A-4)
+#   -> 아랫줄을 오른쪽으로 가서 출구(row 8, col 4)
+#
+# 화면 기준(위가 row 0, 왼쪽이 col 0)으로 보면 반시계 방향이다.
+#
+# 아래 표는 '순환 차선의 중심선'을 이루는 모서리 칸을 주행 순서대로 적은
+# 것이다. 마지막 칸에서 첫 칸으로 돌아오며 닫힌다. 인접한 두 칸을 잇는
+# 선분의 방향이 그 구간의 통행 방향이 된다.
+#
+# 실좌표(cm) 변환은 logic/C02_lot_layout.py가, 경로 계획에 반영하는 것은
+# logic/C01_path_planner.py의 OneWayField가 담당한다.
+#
+# 차선은 통로의 한가운데에 둔다. 주차 구역 바로 옆 칸(col 1 / col 11,
+# row 0 / row 8)이 아니다.
+#
+#   왼쪽 통로 : col 1~4  네 칸  -> 차선 col 2
+#   오른쪽    : col 8~11 네 칸  -> 차선 col 10
+#   윗줄      : row 0~1  두 칸  -> 차선 row 1
+#   아랫줄    : row 6~8  세 칸  -> 차선 row 7
+#
+# 가장자리 칸에 두면 안 되는 이유가 둘이다. 첫째, 경로 계획이 차선을
+# 따라가므로 안내선이 세워둔 차 옆구리를 스치듯 지나간다. 둘째, 자리로
+# 들어가는 마지막 구간이 통로를 가로지르는 모양이 되어 어디서 꺾으라는
+# 것인지 읽히지 않는다. 한가운데면 양쪽 자리로 대칭으로 들어간다.
+#
+# 자리까지의 거리도 여기서 정해진다. 차선에서 자리 열까지가 두 칸이라
+# C01의 목적지 예외 구역(GOAL_RELAX_COLUMNS, 세 줄) 안에 들어온다. 차선을
+# 그보다 더 안쪽으로 옮기면 그 범위를 벗어나고, 자리로 들어가는 구간이
+# 역주행으로 잡힌다.
+#
+# 주차 구역 열(col 0 / col 12) 위에는 둘 수 없다. 주행 불가 칸이라 경로가
+# 차선에서 늘 멀어져 방향장이 흐려진다.
+#
+# 방향을 뒤집으려면(시계 방향) 이 목록의 순서만 뒤집으면 된다.
+ONE_WAY_LOOP = [
+    (7,  2),    # 왼쪽 아래   -> 오른쪽으로 (아랫줄)
+    (7, 10),    # 오른쪽 아래 -> 위로       (오른쪽 통로, D열)
+    (1, 10),    # 오른쪽 위   -> 왼쪽으로   (윗줄)
+    (1,  2),    # 왼쪽 위     -> 아래로     (왼쪽 통로, A열)
+]
+
+
+def one_way_segments():
+    """
+    일방통행 순환선을 (시작칸, 끝칸) 선분 목록으로 반환. 닫힌 고리다.
+
+    Returns:
+        [((row, col), (row, col)), ...] 주행 순서
+    """
+    if len(ONE_WAY_LOOP) < 2:
+        return []
+    return list(zip(ONE_WAY_LOOP, ONE_WAY_LOOP[1:] + ONE_WAY_LOOP[:1]))
+
+
+# 순환선이 실제로 지나갈 수 있는 길 위에 있는지 검사한다.
+# 여기를 통과하지 못하면 경로 계획이 '차선을 따라가려다 벽에 붙는' 이상한
+# 경로를 만든다. 배치를 바꿨을 때 조용히 깨지는 것을 막기 위한 검사다.
+def validate_one_way_loop():
+    problems = []
+    rows_n, cols_n = len(grid_map), len(grid_map[0])
+
+    for (r1, c1), (r2, c2) in one_way_segments():
+        if r1 != r2 and c1 != c2:
+            problems.append(f"ONE_WAY_LOOP 구간 ({r1},{c1})->({r2},{c2})이 "
+                            f"가로/세로가 아닙니다. 모서리 칸만 적을 것.")
+            continue
+
+        dr = (r2 > r1) - (r2 < r1)
+        dc = (c2 > c1) - (c2 < c1)
+        r, c = r1, c1
+        while True:
+            if not (0 <= r < rows_n and 0 <= c < cols_n):
+                problems.append(f"ONE_WAY_LOOP의 ({r},{c})가 격자 밖입니다.")
+                break
+            if grid_map[r][c] not in DRIVABLE_CELLS:
+                problems.append(f"ONE_WAY_LOOP이 주행 불가 칸 ({r},{c})를 지납니다.")
+            if (r, c) == (r2, c2):
+                break
+            r, c = r + dr, c + dc
+
+    return problems
+
+
+# =====================================================================
+# 구역 종류별 배정 우선순위 (고정)
+# =====================================================================
+# 차량 종류에 맞는 구역 중 '이 순서대로' 첫 번째 빈자리를 배정한다.
+# (logic/A01_parking_manager.py의 find_spot_for_car)
+#
+# 입구에서의 직선거리로 자동 정렬하지 않고 손으로 적어둔 이유:
+#   직선거리는 실제 주행거리와 다르다. 예를 들어 A열(왼쪽)은 입구에서 직선으로는
+#   가까워 보여도 주차장을 가로질러 가야 한다. 사람이 보기에 자연스러운 순서는
+#   '입구가 있는 오른쪽 아래에서 시작해 위로, 그다음 반대편'이다.
+#
+# 순서 규칙: 입구(오른쪽 아래)에서 가까운 쪽부터 아래 -> 위.
+#
+# 이 표에 없는 자리는 배정되지 않는다. 즉 이 표는 '덮어쓰기'가 아니라 필수다.
+# 배치를 바꾸면 구역 ID가 밀릴 수 있으므로 아래 검증 경고를 꼭 확인할 것.
+SPOT_PRIORITY = {
+    # 오른쪽 열 아래 -> 위, 그다음 왼쪽 열 아래 -> 위.
+    # 오른쪽 열(col 12)에 4자리, 왼쪽 열은 위쪽 2자리만 남았다.
+    # (row 7의 오른쪽 자리는 실물에서 없어져 통로로 되돌렸다)
+    SPOT1: ["D-4", "D-3", "D-2", "D-1", "A-2", "A-1"],
+
+    # 장애인 구역은 현재 1자리뿐 (왼쪽 열 맨 아래)
+    SPOT2: ["A-4"],
+
+    # 대형 구역은 2칸을 묶어 1자리뿐 (왼쪽 열 가운데, row 4~5)
+    SPOT3: ["A-3"],
+
+    # 중앙 섬. 일방통행 순환을 그대로 따라간다.
+    #
+    # 입구에서 오른쪽 통로를 타고 올라가면 오른쪽 섬(C열)을 아래(row 4)에서
+    # 위(row 3)로 지나치고, 윗줄을 돌아 왼쪽 통로로 내려오면 왼쪽 섬(B열)을
+    # 위(row 3)에서 아래(row 4)로 지나친다. 그 순서가 그대로 배정 순서다.
+    #
+    # 예전에는 "입구에서 가까운 아래쪽 두 자리 먼저"로 C-2, B-2를 묶었는데,
+    # 그러면 B-2에 배정된 차가 C열을 지나쳐 한 바퀴를 돌아 내려온 뒤 다시
+    # 위로 올라가야 한다. 일방통행에서는 지나친 자리로 되돌아갈 수 없다.
+    SPOT4: ["C-2", "C-1", "B-1", "B-2"],
 }
+
+
+# =====================================================================
+# 주차 구역 상태
+# =====================================================================
+# 모든 구역을 "empty"로 만들어 두고, 아래 표에 적은 것만 덮어쓴다.
+#
+# 여기는 '차량 정보 없이 자리만 막아두는' 용도다. (공사중, 사용 불가 등)
+# 차량번호가 없으므로 출차(remove_car)도 요금 계산도 되지 않는다.
+#
+#   실제로 차를 미리 세워둘 거라면 data/car_data.py의 INITIAL_PARKED에 적을 것.
+#   그쪽은 spot_status와 cars_info를 함께 채워서 출차/요금까지 정상 동작한다.
+#
+#   INITIAL_OCCUPIED = {"A-1": "full"}          <- 자리만 막음 (차 정보 없음)
+#   INITIAL_PARKED   = {"A-1": "1234"}          <- 차를 세워둠 (car_data.py)
+#
+# 구역 ID는 grid_map에서 자동 생성되므로, 배치를 바꾸면 여기 적어둔 ID가
+# 사라질 수 있다. 없는 ID를 적으면 아래에서 경고를 출력한다.
+INITIAL_OCCUPIED = {}
+
+spot_status = {spot_id: "empty" for spot_id in spot_map}
+for _spot_id, _status in INITIAL_OCCUPIED.items():
+    if _spot_id not in spot_status:
+        print(f"[경고] INITIAL_OCCUPIED의 '{_spot_id}'는 현재 배치에 없는 구역입니다.")
+        continue
+    spot_status[_spot_id] = _status
+
 
 # =====================================================================
 # 맵 관련 유틸 함수
@@ -126,21 +416,44 @@ def get_cols():
     """그리드 맵의 열 수를 반환합니다."""
     return len(grid_map[0])
 
-def is_valid_pos(row, col):
-    """주어진 좌표가 맵 범위 내이고, 이동 가능한(벽이 아닌) 위치인지 확인합니다."""
-    if 0 <= row < get_rows() and 0 <= col < get_cols():
-        return grid_map[row][col] != WALL
-    return False
+# 차량이 항상 지나갈 수 있는 셀 타입
+DRIVABLE_CELLS = {ROAD, GATE1, GATE2}
 
-def get_all_spot_ids():
-    """정의된 모든 주차 구역 ID 리스트를 반환합니다."""
-    return list(spot_map.keys())
 
-def get_spot_entry_coord(spot_id):
+def get_spot_ids_by_type(cell_type):
     """
-    주차 구역의 진입 좌표(도로와 인접한 첫 번째 칸)를 반환합니다.
-    BFS 경로 탐색 시 목적지로 사용됩니다.
+    특정 종류의 주차 구역 ID 리스트를 반환합니다.
+
+    예: 장애인 차량 전용 배정
+        get_spot_ids_by_type(SPOT2)  ->  ["A-5"]
     """
-    if spot_id in spot_map:
-        return spot_map[spot_id][0]
-    return None
+    return [s for s, t in spot_type.items() if t == cell_type]
+
+def get_spot_cell_count(spot_id):
+    """주차 구역이 차지하는 격자 칸 수. (대형 구역은 2)"""
+    return len(spot_map.get(spot_id, ()))
+
+
+# SPOT_PRIORITY 검증.
+# 배치를 바꾸면 구역 ID가 밀리므로, 여기서 걸러주지 않으면 우선순위가 조용히
+# 무시된 채 엉뚱한 자리로 배정된다.
+for _cell_type, _order in SPOT_PRIORITY.items():
+    _actual = set(get_spot_ids_by_type(_cell_type))
+    _listed = set(_order)
+
+    if len(_order) != len(_listed):
+        print(f"[경고] SPOT_PRIORITY[{SPOT_TYPE_NAME.get(_cell_type, _cell_type)}]에 "
+              f"중복된 구역 ID가 있습니다.")
+
+    for _unknown in sorted(_listed - _actual):
+        print(f"[경고] SPOT_PRIORITY의 '{_unknown}'은 "
+              f"{SPOT_TYPE_NAME.get(_cell_type, _cell_type)} 구역이 아니거나 "
+              f"현재 배치에 없습니다. (무시됨)")
+
+    for _missing in sorted(_actual - _listed):
+        print(f"[경고] {SPOT_TYPE_NAME.get(_cell_type, _cell_type)} 구역 "
+              f"'{_missing}'이 SPOT_PRIORITY에 없습니다. (배정되지 않습니다)")
+
+# 일방통행 순환선 검증. (DRIVABLE_CELLS가 정의된 뒤여야 하므로 여기서 부른다)
+for _problem in validate_one_way_loop():
+    print(f"[경고] {_problem}")

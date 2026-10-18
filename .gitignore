@@ -37,7 +37,36 @@ Desktop.ini
 *.png
 *.mp4
 
+# 발표 자료 (가이드라인 원본 + 산출 PPT + 스케치)
+ppt/
+
 # 대용량 소스/빌드 산출물
 python_code/logic/torchvision_src/
 torchvision_src/
+yolo_dataset/
 *.whl
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# 런타임 생성물 (카메라 설치마다 달라짐)
+python_code/config/homography.npz
+python_code/marker_frame.jpg
+python_code/marker_debug.jpg
+
+# 모델 가중치.
+# 용량이 크고(.onnx 하나가 40MB대) .engine은 젯슨의 GPU/TensorRT 버전에
+# 묶여 있어 다른 기기에서 열리지 않는다. 저장소에 두면 클론만 무거워진다.
+# .pt(원본 가중치)는 따로 백업할 것. imgsz를 바꾸면 여기서 다시 export한다.
+*.engine
+*.onnx
+*.pt
+
+# 기둥 보정 좌표.
+# 카메라를 어디에 어떤 각도로 달았는지에 묶인 값이라 기기마다 다르다.
+# 저장소가 들고 있으면 젯슨에서 /calibrate로 다시 찍을 때마다 수정된
+# 파일이 되어, 코드를 받을 때마다 충돌한다. 기기에 두고 각자 관리한다.
+# (없으면 프로그램이 /calibrate 페이지로 안내한다)
+python_code/config/pillar_pixels.json
