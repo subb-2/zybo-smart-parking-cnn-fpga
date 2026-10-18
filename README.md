@@ -55,25 +55,8 @@
 
 ## 🏗️ 시스템 구조
 
-```text
-                         ┌──────────────────────── Zybo Z7-20 ────────────────────────┐
-                         │                                                             │
- Pcam 5C ──MIPI CSI-2──▶ │ [PS] OV5640 I2C 설정 → D-PHY RX → CSI-2 RX → Bayer→RGB      │
- (OV5640)                │      → Gamma → AXI VDMA ⇄ DDR → HDMI 출력 (720p)            │ ──HDMI──▶ 모니터
-                         │                    │ (영상 pclk 영역)                        │
-                         │                    ▼                                        │
- HC-SR04 ──echo/trig──▶  │ [PL] SR04 FSM ──vga_start──▶ FrameController                │
-                         │      (100MHz)   ◀─vga_done──  (Crop → Mono → Register)      │
-                         │         │                          │                        │
-                         │         │                          ▼                        │
-                         │         │                   Pixel Buffer (BRAM, 2-clock)     │
-                         │         │                          │                        │
-                         │         │   AXI Weight Loader ──▶ CNN 가속기 (LeNet-5)        │
-                         │         │   (PS → Weight BRAM)      │ inf_done / inf_out      │
-                         │         ◀───────── cnn_done ───────┘                        │
-                         │         ▼                                                   │
- SG90  ◀──── PWM ─────── │   차단바 열림/닫힘            UART ──▶ ESP32 ──Wi-Fi──▶ Jetson │
-                         └─────────────────────────────────────────────────────────────┘
+```
+ <img width="1231" height="744" alt="Image" src="https://github.com/user-attachments/assets/c94fa3c6-9bed-499f-aea9-f97c1d6eb3f0" />
 ```
 
 * **클럭 영역**: 영상 경로는 Pcam 영상 pclk, 초음파 센서 FSM과 AXI 로직은 PS의 100MHz(FCLK_CLK0)에서 동작합니다. 두 영역을 오가는 1비트 제어 신호는 모두 Toggle 방식 Pulse Synchronizer로 넘겼습니다.
